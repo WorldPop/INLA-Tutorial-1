@@ -1,0 +1,409 @@
+\documentclass{article}
+\usepackage{hyperref}
+%\usepackage{xcolor}
+
+
+\title{ }
+\begin{document}
+
+\maketitle
+\section{Background:  Why INLA, and why this tutorial?}
+This is a brief tutorial describing the process of using R-INLA to model spatial data. I am not an expert at using this software, and there are other better tutorials out there on the INLA  \href{http://www.r-inla.org/}{\textcolor{blue}{website}}.  I'm re-inventing this particular wheel somewhat to better understand the wheel in question, and as fodder for a new blog post.
+
+R-INLA provides a front-end language for accessing a set of tools for performing Integrated Nested Laplacian Approximation.  The nuts and bolts are better explained by others here:, but what you need to know is that it's a way to work with certain kinds of Bayesian Likelihoods that doesn't rely on Gibbs sampling to estimate joint posterior distributions.  That means we can build spatial models without having to wait years for the darned thing to converge.
+
+I'll leave discussion of the various merits or disadvantages of the approach to others, and simply get to the doing. I'll first assume that you've been to the INLA \href{"http://www.r-inla.org/download"}{\textcolor{blue}{download page}} and gotten it installed on your version of R.
+
+\section{Data}
+The response data are from a set of 1667 clusters of household surveys.  Each survey provides the number of individuals within a household in a set of age categories, of which the Age under 5 is of primary interest.  We should therefore have numbers of individuals in 20 5-year age groups, as well as the total number of people per household.  Unfortunately, surveys are aggregated into clusters representing between 7 and 40 households, depending on 1) what type of survey was conducted (out of three possible types) and 2) factors associated with variability in sampling effort - we'll assume these are random factors.  So for each cluster, we have numbers of children under 5,  total number of people counted, number of households surveyed. 
+
+In terms of classification and prediction variables, we have a set of factors such as Region and Province (Table \ref{tab:rawdat1}). Along with each cluster, we have a set of covariates derived from a GIS analysis done by Alessandro.  We have 1 km resolution spatial data on distance to roads, poverty index, vegetation cover, brighness of lights at night (Table \ref{tab:rawdat2}). First, we need to clean up the data.
+
+<<load_data, echo=TRUE, results='asis', message=FALSE>>=
+library(xtable)
+setwd("/Users/tjb1a13/Google Drive/SOTON/INLA_LEARNING/1. Starting with Inla")
+polio=read.csv("polio_sm.csv")
+@
+
+
+<<cleanup.data, echo=TRUE, message=FALSE, tidy=FALSE>>=
+polio$Season=with(polio, 
+                  ifelse(Month %in% c("August", "September") |
+                           Month=="August to October", "Autumn", 
+                  ifelse(Month %in% c("June", "July"), 
+                         "Summer", "Winter")))
+polio$NS=with(polio, 
+              ifelse(grepl("north", REGION, ignore.case=T), 
+                     "North", "South"))
+polio$EW=with(polio, 
+  	ifelse(grepl("Central", REGION, ignore.case=T), 
+           "Central", 
+		ifelse(grepl("West", REGION, ignore.case=T),
+           "West", "East")))
+polio$Region=with(polio, paste(NS,EW, sep="_"))
+polio$Prov=toupper(polio$PROV)
+polio$Prov=substr(polio$Prov,1,3)
+polio$Prov=with(polio, 
+                ifelse(grepl("ABUJ", polio$PROV, ignore.case=T), 
+                       "ABU", Prov))
+polio$Year=as.factor(polio$Year)
+polio$U_R=ifelse(polio$U_R=="U", 1,0)
+colnames(polio)[c(18:27)]=c("Access", "N.L.", "Veg", 
+                            "Cnfevn", "Pov", "wpsdst", 
+                            "roads", "Schl", "eth", 
+                            "globc")
+polio$N.L.[polio$N.L.<=0]=0.01
+@
+
+
+<<tab,results='asis',  message=FALSE, echo=FALSE>>=
+require(xtable)
+print(xtable(head(polio[,c("ID","Type", "Year", "Season", 
+                           "Lat","Long",  "Region", "Prov",
+                           "U_R", "A_U5", "P_U5")], n=6), 
+             caption="Cluster and regional data used in this example", 
+             label="tab:rawdat1"),
+             size="tiny",
+             include.rownames=F)
+@
+
+
+
+<<rawdat2, echo=FALSE, results='asis', message=FALSE>>=
+print(xtable(head(polio[,c(18:27)], n=6), 
+             caption="Cluster and regional data 
+                      used in this example", 
+             label="tab:rawdat2"),
+             size="tiny",
+             include.rownames=F,
+              )
+@
+
+Our aim is to create a predictive model for the number of children under 5 based on covariate data, and to use this to project across all of Nigeria.
+
+\section{A simple model}
+We start with a simple regression model to get our feet wet with INLA. Those familiar with regression models in R will be comfortable with the basic syntax for calling models.  
+
+\subsection{Data preparation}
+One of the main assumptions used in INLA is that the data are Normally distributed, so we need to transform covariate data prior to modeling.  It is also recommended that the data be centered.  We also log transform some of the covariates.
+
+<<CentreData, echo=TRUE>>=
+my.center = function(x) (x - mean(x))
+polio$C.NightLight=my.center(log(polio$N.L.))
+polio$C.poverty=my.center(polio$Pov)
+polio$C.vegetation=my.center(polio$Veg)
+
+@
+
+\subsection{Fixed effects model}
+Now we can run a simple linear model.  To do so, we first define a formula which is passed to the inla() function call. Here, we try a model with all continuous covariates, and one categorical for "Urban" or "Rural".  Note that inla doesn't currently support categorical covariates, so we simply use dummy variables and set Urban=1 and Rural =0.
+<<Simple.Linear.Model, echo=TRUE, results='asis', tidy=FALSE, message=FALSE >>=
+### simple linear model
+fe.formula=P_U5~C.NightLight + 
+                C.poverty + 
+                C.vegetation + 
+                U_R
+
+require(INLA)
+Ires=inla(fe.formula, 
+          family="gaussian", 
+          data=polio, 
+  		    control.compute=list(dic=T))
+@
+Here we model the proportion of under 5's as gaussian random variables, with Night lights, poverty, vegetation cover and Urban/Rural as covariates.
+
+
+<<Ires.coef, echo=FALSE, results='asis'>>=
+xtable(summary(Ires)[[3]], caption="Coefficients from a 
+                gaussian linear model via INLA")
+
+@
+
+For comparison, we can try a simple linear regression using lm().  Here, the inla formula can be recycled as it follows the same syntax.
+<<lm, echo=TRUE, results='asis'>>=
+lmres=lm(fe.formula, data=polio)
+@
+
+<<lmtab, echo=FALSE, results='asis'>>=
+xtable(summary(lmres), caption="Coefficients from a gaussian linear model via lm()")
+@
+
+\subsection{Random effects}
+To start building hierarchical models with inla we can specify simple random effects models as in R functions lme() etc.  For example, we might be interested in accounting for Regional (North, South, East, West) differences (figure \ref{fig:plot.Reg}.  Here, we include a region-specific random effect.
+
+<<plot.Reg, echo=TRUE, results='asis', message=FALSE, warning=FALSE, fig.cap="Regional differences in the distribution of P.U5", tidy=FALSE>>=
+require(ggplot2)
+regplot=ggplot(polio, aes(x=P_U5, fill=Region))+
+    geom_histogram()+
+    facet_wrap(~Region)+
+    theme(legend.position=c(0.85, 0.25),
+          panel.background=element_rect(fill="white", 
+                                        colour="black"))
+regplot
+@
+
+To define a random effect, we use the f() function in INLA.  The "model=iid" signifier defines independent, identically distributed  random effects.  
+
+<<R.ef_inla, echo=TRUE, results='asis', tidy=FALSE>>=
+R.E.formula=P_U5~C.NightLight + 
+                 C.poverty + 
+                 C.vegetation +
+                 U_R + 
+                 f(Region, model="iid")
+
+R.E.inla=inla(formula=R.E.formula, data=polio, 
+              family="gaussian",
+              control.compute=list(dic=T))
+@
+
+<<inla_rfx, echo=FALSE, message=FALSE, results='asis'>>=
+xtable(summary(R.E.inla)[[4]][,1:2], caption="precision of regional random effects from INLA")
+@
+
+In comparison to random effects from lmer results (table \ref{tab:lme.re}), we find that the precision for the intercept is similar, but that the inla model has about twice the precision at within Regions relative to the lme model.  I might be misunderstanding something here, in terms of how the model is specified.
+
+<<lmeRFX, echo=TRUE, message=FALSE>>=
+require(lme4)
+lme.rfx=lmer(P_U5~C.NightLight + 
+                 C.poverty + 
+                 C.vegetation + 
+                 U_R + (1|Region), 
+                 data=polio)
+lmeres=data.frame(VarCorr(lme.rfx))
+lmeres$precision=1/lmeres$vcov
+@
+
+<<lmer_RFX, echo=FALSE, results='asis'>>=
+print(xtable(lmeres[,c(1,2,4,5,6)], caption="Standard deviations of Regional random effects from lmer model", label="tab:lme.re"))
+@
+
+
+\subsection{Observations versus predictions}
+With this simple model, we can compare fitted values against the data.
+
+<<obs.v.pred, echo=TRUE, results='asis', warning=FALSE, message=FALSE, tidy=FALSE, fig.cap="Observed versus predicted values of Percentage under 5's and Numbers under 5 from the Random effects model for Nigeria.">>=
+polio.pred=data.frame(obs=polio$P_U5, 
+              A_U5=polio$A_U5, 
+              no.HH=polio$no.HH, 
+              pred=R.E.inla$summary.fitted.values$mode, 
+              pred.num=polio$Totpop*R.E.inla$summary.fitted.values$mode)
+
+perc=ggplot(polio.pred, aes(x=obs, y=pred))+
+    geom_point(alpha=0.3) +
+    theme(panel.background=element_rect(fill="white", 
+                                        colour="black"))+
+    geom_abline(intercept=0, slope=1)+
+    ylim(c(0,max(polio$P_U5)))+
+    ylab("Predicted proportion under 5's")+
+    xlab("Observed proportion under 5's")
+
+num= ggplot(polio.pred, aes(x=A_U5, y=pred.num))+
+    geom_point(alpha=0.3) +
+    theme(panel.background=element_rect(fill="white", 
+                                        colour="black"))+
+    geom_abline(intercept=0, slope=1)+
+    ylim(c(0,max(polio$A_U5)))+
+    ylab("Predicted Number under 5's")+
+    xlab("Observed Number under 5's")
+  
+require(gridExtra)
+
+grid.arrange(perc, num)
+@
+
+The predicted range of percentage values is quite small compared to the observed range (figure \ref{fig:obs.v.pred}). However, looking at the total predicted numbers, we find that this range of proportions is sufficient to capture much of the variability in terms of numbers. Comparing the random effects model to the simple model, we find that it has a lower DIC (-4995 vs -4972 ). Now we can explore other hierarchical structures with spatial information. 
+
+
+\section{Making it spatial} 
+Bringing in spatial data requires a number of things:
+\begin{itemize}
+\item Spatially referenced covariate data
+\item A border to draw around the data
+\item A way to create a gaussian field from the observations that can be mapped to other areas.
+\end{itemize}
+We have 1) and 2) from Alessandro and Carla.  We use INLA to make 3) 
+
+\subsection{Data import}
+Covariate data for nigeria are saved in .tif format and imported using spatial analysis tools in R.  For now we focus on the three continuous covariates in the previous analysis: vegetation, poverty and NightLights.  We import the .tif files as rasters,  stack them and extract a lower resolution dataset to speed up processing for the purposes of this demonstration. We also centre and log transform where appropriate.
+
+<<tif_import, echo=TRUE, message=FALSE, warning=FALSE, tidy=FALSE>>=
+require(dismo)
+require(rgdal)
+require(sp)
+require(maptools)
+require(rgeos)
+setwd("~/Google Drive/SOTON/INLA_LEARNING/Copied_Data/GIS_Data")
+tifs=dir()[grepl(".tif", dir(), fixed=T)]
+
+# stack and aggregate
+tifs.all=stack(tifs)
+tifs.low=aggregate(tifs.all, fact=4, fun=mean)
+
+# Get Boundaries
+NigBound=boundaries(tifs.low[[1]])
+NigPoly=rasterToPolygons(NigBound, fun=function(x) !is.na(x))
+Nigborder <- unionSpatialPolygons(NigPoly, rep(1, nrow(NigPoly)))
+@
+
+
+\subsection{Mesh for the spatial field}
+With the polygon boundary for Nigeria, we create a mesh which will be used to build the Guassian random field.  There are a number of ways to create this mesh which are described in the INLA tutorials. Here we use the boundary defined by the edge of the .tif data (figure \ref{fig:inla.mesh})
+
+<<inla.mesh, echo=TRUE, message=FALSE, results='asis', tidy=FALSE, fig.cap="Nigeria spatial field mesh">>=
+# Create inla mesh
+require(INLA)
+Nig.bdry <- inla.sp2segment(Nigborder)
+nig.mesh <- inla.mesh.2d(boundary=Nig.bdry, cutoff=0.15,max.edge=c(0.3, 1))
+plot(nig.mesh)
+
+#nig.domain=Nigborder@polygons[[1]]@Polygons[[1]]@coords 
+#nig.mesh=list(mesh=nig.mesh, domain=domain)
+#save(nig.mesh, file="~/Google Drive/SOTON/Papers/Nigeria_MN_Age/Analysis/GIS_Data/nig.mesh.R")
+@
+
+\subsection{Projecting Data onto the Mesh}
+With the mesh, we create a projection matrix that lines up our observation data, covariates and the random field. We define a spatial resolution and restrict the matrix to within the borders of Nigeria. I find it useful to plot the coordinates of the projection grid to make sure it looks right (figure \ref{fig:plot.proj})
+
+<<mesh.proj, echo=TRUE, message=FALSE, results='asis', tidy=FALSE>>=
+## create spde field
+A = inla.spde.make.A(nig.mesh, 
+                     loc=as.matrix(polio[,c("Long", "Lat")]))
+spde = inla.spde2.matern(nig.mesh, alpha=2)
+mesh.index = inla.spde.make.index(name="field",
+              n.spde=spde$n.spde)  
+
+## define projection grid
+nxy=c(289,361)
+projgrid <- inla.mesh.projector(nig.mesh, 
+              xlim=range(prdcoord[,1]),
+              ylim=range(prdcoord[,2]), 
+              dims=nxy,
+              project="longlat") 
+#require(splancs)
+### coordinates of projection grid that are in or out
+#xy.in <- inout(projgrid$lattice$loc, 
+#              nig.domain, bound=T)
+prdcoord=coordinates(tifs.low)[!is.na(values(tifs.low[[1]])),]
+
+@
+
+<<plot.proj, echo=TRUE, results='asis', fig.cap="Coordinates of projection matrix">>=
+## plot
+plot(prdcoord, cex=0.2)
+plot(nig.mesh, add=T)
+@
+
+\subsection{Create a data stack}
+In order to make everything line up, we use a data stack based on the projection field.
+
+<<make.stack, echo=TRUE, warnings=FALSE, tidy=FALSE>>=
+## stack reponses and predictors.
+## I have included a few other responses for later analyses.
+stk.dat <- inla.stack(data=list(A_U5=polio$A_U5,
+  P_U5=polio$P_U5,
+        AU5_HH=with(polio, ((A_U5)/no.HH))),
+        A=list(A,1), tag='dat',
+        effects=list(list(i=1:spde$n.spde),
+        data.frame(Intercept=1,
+                C.vegetation = polio$C.vegetation,
+                C.poverty=polio$C.poverty,
+                C.NightLight=polio$C.NightLight)))
+
+@
+
+We can now run a model with a spatial Gaussian random field, given by f(i,model=spde).
+
+<<spde.model, echo=T, message=FALSE, tidy=FALSE>>=
+f.pc.spde=P_U5~0+ Intercept+
+                  C.poverty + 
+                  C.NightLight + 
+                  C.vegetation+
+                  f(i, model=spde)
+
+spde.pc.res=inla(f.pc.spde, family="gaussian",
+    data=inla.stack.data(stk.dat), 
+		control.predictor=list(A=inla.stack.A(stk.dat), 
+                           compute=TRUE), 
+		control.compute=list(dic=T))
+@
+
+ We find that the mode with the spatial random field provides a marginally tighter fit to the data (figure \ref{fig:plot.spde.pred}) and a lower DIC score (-5086 vs -4995).  I think this means that the regional differences are better described by the Gaussian random field defined above than by simple N/S, E/W descriptors. 
+
+<<plot.spde.pred, echo=FALSE, warning=FALSE, message=FALSE, tidy=FALSE, fig.cap="observed versus predicted values for two hierarchical models with spatial random effects.  Black dots are for a model with simple NS/EW spatial information, while red dots indicate a model using a gaussian random field to describe the spatial distribution of P.U5's.">>=
+polio.pred$spde.pred.num=polio$Totpop*spde.pc.res$summary.fitted.values$mode[1:nrow(polio)]
+library(scales)
+with(polio.pred, plot(A_U5, pred.num, pch=16, 
+                      col="black",
+                      xlab="Observed # under 5's",
+                      ylab="Predicted # under 5's",
+                      ylim=range(A_U5)))
+with(polio.pred, points(A_U5, spde.pred.num, pch=16, 
+                        col="red"))
+legend(0,90, legend=c("spde model", "no spde"), 
+             pch=c(16,16), 
+             col=c("red","black"),
+             bty="n")
+abline(a=0, b=1)
+  
+@
+
+
+\subsection{Predict into unsampled space}
+To predict into unsampled space, we need to provide covariate data to the model, along with locations where we want predictions.  To do this, we stack the existing data with a new data frame containing the gridded covariate data along with missing values in the predictor spaces. We also need to make sure that the environmental covariates in the spaces we are predicting into are transformed in the same way as the covariates used in the model.
+<<spde.pred, echo=TRUE, warnings=FALSE, tidy=FALSE>>=
+NL=extract(tifs.low[["NightLight"]], prdcoord )
+logNL=ifelse(NL<=0, log(0.01), log(NL))-mean(log(polio$N.L.))
+Pov=extract(tifs.low[["poverty"]], prdcoord )-mean(polio$Pov)
+Veg=extract(tifs.low[["Vegetation"]], prdcoord )-mean(polio$Veg)
+Aprd = inla.spde.make.A(nig.mesh,
+                     loc=prdcoord)
+
+stk.prd <- inla.stack(data=list(P_U5=NA),
+  A=list(Aprd,1), tag='prd',
+	effects=list(list(i=1:spde$n.spde), 
+	data.frame(Intercept=1,
+		C.NightLight = logNL, 
+		C.poverty=Pov,
+		C.vegetation=Veg)))
+@
+
+Next we run the model on the full dataset, resulting in a prediction field for percentage of under 5's (figure \ref{fig:spde.full}). 
+
+<<spde.full, echo=TRUE, message=FALSE, results='asis', tidy=FALSE, fig.cap="Predicted proportion of under 5's", eval=TRUE>>=
+stk.all=inla.stack(stk.dat, stk.prd)
+Ires.pc.pred=inla(f.pc.spde, family="gaussian",
+    data=inla.stack.data(stk.all), 
+		control.predictor=list(A=inla.stack.A(stk.all), 
+                           compute=TRUE), 
+		control.compute=list(dic=T))
+
+### get predicted surface
+id.prd <- inla.stack.index(stk.all, 'prd')$data
+sd.prd <- m.prd <- matrix(NA, length(id.prd),3)
+sd.prd[,2:3]<-m.prd[,2:3]<-prdcoord[,1:2]
+m.prd[,1] <- Ires.pc.pred$summary.fitted.values$mode[id.prd]
+colnames(m.prd)=c("mn", "x", "y")
+m.prd=data.frame(m.prd)
+sd.prd[,1] <- Ires.pc.pred$summary.fitted.values$sd[id.prd]
+
+library(ggplot2)
+ggplot(m.prd, aes(x=x, y=y, fill=mn)) + geom_raster()
+@
+
+The ugly border around the edge of the raster has to do with how I've defined the projection matrix 
+
+\section{Next steps:}
+Next in line for these data are the following:
+\begin{enumerate}
+\item Try predicting numbers of under 5's per household
+\item Add random effects on Region/Province 
+\item Explore spatial structure of covariates
+\item Multinomial model for proportion of individuals in each age class.
+\end{enumerate}
+
+
+
+
+
+
+\end{document}
